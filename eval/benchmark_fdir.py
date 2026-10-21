@@ -56,6 +56,8 @@ class EpisodeResult:
     predicted_class: Optional[int] = None
     true_class: int = 0
     surprise_peak: Optional[float] = None
+    false_alarm: bool = False
+    alarm_count: int = 0
 
 
 def build_controllers(
@@ -188,6 +190,7 @@ def evaluate_controller(
     batch = env.num_envs
     results: List[EpisodeResult] = []
     surprises = torch.zeros(env.env_cfg.max_episode_steps, batch, device=device)
+    alarms = torch.zeros(env.env_cfg.max_episode_steps, batch, device=device)
     threshold: Optional[float] = None
 
     # Calibrate the surprise detector on the first nominal batch.
@@ -220,26 +223,43 @@ def evaluate_controller(
         controller.reset(batch, device)
         obs = env._observation()
         surprises.zero_()
+        alarms.zero_()
         for t in range(env.env_cfg.max_episode_steps):
             action = controller.act(obs)
             out = env.step(action)
             obs = out.obs
             if is_world_model and hasattr(controller, "surprise"):
                 surprises[t] = controller.surprise.detach()
+            if is_world_model and hasattr(controller, "alarm"):
+                alarms[t] = controller.alarm.detach().to(alarms.dtype)
             done = out.terminated | out.truncated
             if done.any():
                 s = out.info["state"]
                 for i in torch.nonzero(done).flatten().tolist():
                     latency = None
                     peak = None
+                    false_alarm = False
+                    alarm_count = 0
                     if is_world_model and threshold is not None:
                         # The injector activates the fault on the ``onset``-th
                         # call to step, i.e. at loop index ``onset - 1``.
                         start = max(0, onset - 1)
                         window = surprises[start : t + 1, i]
                         peak = float(window.max()) if window.numel() else None
-                        hits = (window > threshold).nonzero()
+                        # The latency is measured on the controller's *alarm*
+                        # (the debounced decision), not on a single sample
+                        # above the threshold.
+                        alarm_window = alarms[start : t + 1, i]
+                        hits = (alarm_window > 0.5).nonzero()
                         latency = int(hits[0]) if hits.numel() else None
+                        alarm_count = int((alarms[: t + 1, i] > 0.5).sum())
+                        # A false alarm is an alarm outside the detection
+                        # window: before the onset for a faulted episode,
+                        # anywhere for a nominal one.
+                        if mode == 0:
+                            false_alarm = alarm_count > 0
+                        else:
+                            false_alarm = bool((alarms[:start, i] > 0.5).any())
                     logits = controller.last_debug.get("fault_logits") if is_world_model else None
                     predicted = int(logits[i].argmax()) if logits is not None else None
                     results.append(
@@ -259,6 +279,8 @@ def evaluate_controller(
                             predicted_class=predicted,
                             true_class=int(mode),
                             surprise_peak=peak,
+                            false_alarm=false_alarm,
+                            alarm_count=alarm_count,
                         )
                     )
                 # Keep recurrent state consistent with auto-resets.
@@ -296,6 +318,13 @@ def summarize(results: List[EpisodeResult], dt: float, mode: int) -> Dict[str, o
             None if mode == 0 or not latencies else sum(latencies) / len(latencies) * dt * 1000.0
         ),
         "detection_rate": None if mode == 0 else len(latencies) / n,
+        # Fraction of episodes that raised an alarm outside the detection
+        # window (before the onset for a faulted episode, anywhere for a
+        # nominal one).  This is the false-alarm rate of the detector.
+        "false_alarm_rate": sum(r.false_alarm for r in results) / n,
+        "mean_alarm_count": (
+            sum(r.alarm_count for r in results) / n if results else 0.0
+        ),
         "fault_classification_accuracy": accuracy,
         "mean_surprise_peak": (
             None

@@ -39,11 +39,12 @@ a differentiable simulator and measures it:
   stack.
 
 On the published benchmark (20 episodes per fault mode, deterministic seed)
-the detector alarms **0.90 steps (18 ms)** after the onset with **100 %
-detection** and **99-100 % isolation**, and the FDIR stack lands **90-100 %**
-of the faulted flights where a non-adaptive cascaded-PID reference lands
-**0-40 %**.  The full measurement trail, including the numbers that did *not*
-work, is in [`results/TRAINING_REPORT.md`](results/TRAINING_REPORT.md).
+the detector alarms **2.00 steps (40 ms)** after the onset with **100 %
+detection**, **96-100 % isolation** and a **0 % false-alarm rate** on nominal
+flights, and the FDIR stack lands **90-100 %** of the faulted flights where a
+non-adaptive cascaded-PID reference lands **0-10 %**.  The full measurement
+trail, including the numbers that did *not* work, is in
+[`results/TRAINING_REPORT.md`](results/TRAINING_REPORT.md).
 
 ---
 
@@ -55,33 +56,36 @@ fault mode, 8 parallel environments, seed 0, onset 150, severity 0.35 (LOE) /
 
 | controller | nominal | LOE thrust | gimbal bias | gimbal stuck | CoM shift |
 | :-- | --: | --: | --: | --: | --: |
-| `Cascaded-PID` (non-adaptive reference) | 95 % | 15 % | 0 % | 40 %¹ | 0 % |
-| `PPO (model-free residual)` | 100 % | 75 % | 0 % | 10 % | 0 % |
-| **`AeroWM-FDIR (actor)`** | **100 %** | **100 %** | **95 %** | **95 %** | **100 %** |
-| **`AeroWM-FDIR (MPPI)`** | **95 %** | **90 %** | **90 %** | **90 %** | **90 %** |
+| `Cascaded-PID` (non-adaptive reference) | 100 % | 5 % | 0 % | 0 % | 10 % |
+| `PPO (model-free residual)` | 95 % | 50 % | 0 % | 5 % | 5 % |
+| **`AeroWM-FDIR (actor)`** | **100 %** | **95 %** | **90 %** | **90 %** | **100 %** |
+| **`AeroWM-FDIR (MPPI)`** | **90 %** | **100 %** | **95 %** | **95 %** | **90 %** |
 
-¹ Eight of the twenty freezes are *benign* (the nozzle seizes within 1° of
-the vertical, so the flight is essentially healthy).  The classical law lands
-**0/16** of the severe freezes and **0 %** on the 48-episode unit-test
-protocol — see [§6](#6-what-the-baseline-cannot-do)
-and [`LIMITATIONS.md`](LIMITATIONS.md).
+The classical reference is **non-adaptive** and is not told the fault: it
+lands 100 % of the nominal flights and 0-10 % of the faulted ones.  The
+`GIMBAL_STUCK` mode has no benign freezes left in the fault model (a TVC
+that seizes within a fraction of a degree of the vertical does not degrade
+the flight, so it is not a fault — see
+[`LIMITATIONS.md`](LIMITATIONS.md) §2).
 
 **Detection and isolation** (same run; `scripts/check_fdir.py` reproduces it
 standalone):
 
-| controller | LOE | bias | stuck | CoM | mean latency | isolation |
-| :-- | --: | --: | --: | --: | --: | --: |
-| actor | 0.95 | 0.90 | 0.85 | 0.90 | **0.90 steps (18 ms)** | **100 %** |
-| MPPI | 0.90 | 1.00 | 0.85 | 0.85 | **0.90 steps (18 ms)** | 99 % |
+| controller | LOE | bias | stuck | CoM | mean latency | isolation | false alarms |
+| :-- | --: | --: | --: | --: | --: | --: | --: |
+| actor | 2.0 | 2.0 | 2.0 | 2.0 | **2.00 steps (40 ms)** | **96.2 %** | **0 %** |
+| MPPI | 2.0 | 2.0 | 2.0 | 2.0 | **2.00 steps (40 ms)** | **100 %** | **0 %** |
+
+Detection is 100 % in every fault mode for both controllers.
 
 **Verification gates**
 
 | gate | requirement | measured | verdict |
 | :-- | :-- | :-- | :-- |
-| 1 — physics throughput | SPS ≥ 200 k | **262 046** (full env, B = 1024) | ✅ |
-| 2 — classical reference | nominal ≥ 90 %, faults ≤ 50 % | 95 % nominal, worst fault 40 % | ✅ |
-| 3 — real-time FDIR | latency ≤ 3 steps, isolation ≥ 92 % | 0.90 steps (18 ms), 100 % / 99 % | ✅ |
-| 4 — recovery | ≥ 85 % in every mode (actor and MPPI) | 95-100 % (actor), 90-95 % (MPPI) | ✅ |
+| 1 — physics throughput | SPS ≥ 200 k | **267 915** (full env, B = 1024; 262-278k across runs) | ✅ |
+| 2 — classical reference | nominal ≥ 90 %, faults ≤ 50 % (**≤ 30 %**) | 100 % nominal, worst fault 10 % | ✅ |
+| 3 — real-time FDIR | latency ≤ 3 steps, isolation ≥ 92 % | 2.00 steps (40 ms), 96-100 % isolation, 0 % false alarms | ✅ |
+| 4 — recovery | ≥ 85 % in every mode (actor and MPPI) | 90-100 % (actor), 90-100 % (MPPI) | ✅ |
 
 `pytest tests -q` → **119 passed** (8 min, includes the slow PID gate
 benchmarks).
@@ -123,11 +127,13 @@ benchmarks).
    GRU state (linear probe R² = 0.27 for `z` versus 0.86 for `h`).  The
    residual of the *known* actuator and engine models against the measured
    telemetry is not: it is 25-40 σ for a gimbal bias and ~2000 σ for a
-   centre-of-mass shift, and it is available in a single sample.
+   centre-of-mass shift, and it is available in a single sample.  It is also
+   *specific*: in nominal flight its score is 0.019 and never leaves it, so
+   the alarm can require physical evidence and the false-alarm rate is 0 %.
 2. **A latched fault decision.**  Compensating a fault erases the evidence
-   that identified it, so the class is decided once (two samples after the
-   alarm, with the 2-sample frozen-servo confirmation taking priority) and
-   never rewritten back to nominal.
+   that identified it, so the class is decided once (7 samples after the
+   alarm, with the frozen-servo confirmation taking priority) and never
+   rewritten back to nominal.
 3. **Physically read-out fault magnitudes.**  The gimbal bias is deconvolved
    exactly (`b = res_gimbal / (1 − e^{−dt/τ})`), the thrust loss comes from
    the measured/commanded thrust ratio, and the CoM offset from the
@@ -140,7 +146,7 @@ benchmarks).
    The non-adaptive reference keeps *no* fault logic at all.
 5. **A model-free comparison that is not a straw man.**  The PPO baseline is
    a bounded residual around the same classical law, so it can fly but cannot
-   *identify* a fault: 0 % on gimbal bias and CoM shift, 10 % on a frozen
+   *identify* a fault: 0 % on gimbal bias and CoM shift, 5 % on a frozen
    gimbal.
 
 ---
@@ -169,8 +175,23 @@ step-to-step σ normalisation, and a 5-step EMA.  The anomaly score is
 S_t = 0.1·D_KL(q||p) + innovation + residual_score + 20·frozen + 50·CoM
 ```
 
-and the isolation head refines a physics-informed prior (bounded logits, so a
-mis-calibrated learned head cannot override the physics).
+where `residual_score` covers the six *physics* channels only — the
+command-tracking channels measure the actuator's tracking error, which
+reaches 6 σ during the terminal phase of a healthy flight and is not a fault
+signature.
+
+The **alarm** is stricter than the score: it needs the score above the
+calibrated threshold *and* physical evidence (a residual above 0.5, a
+frozen servo or a CoM offset), over two consecutive samples.  In nominal
+flight the physics-residual score is 0.019 and never leaves it, so the
+measured false-alarm rate is **0 %** while the fault signature is above 1.5
+within a single sample.
+
+The isolation head refines a physics-informed prior (bounded logits, so a
+mis-calibrated learned head cannot override the physics).  A seized axis is
+recognised because the plant holds it *bit-stationary* over four consecutive
+samples — a biased axis keeps tracking the command and never stands still
+that long.
 
 ### 3.3 Control (`agents/`)
 
@@ -179,9 +200,11 @@ position/velocity PD, a quaternion-error attitude PD with a saturation-aware
 tilt limiter, and a terminal flare.  `AeroWM-FDIR` — the same law, driven by
 the *detected* fault parameters, plus a bounded learned residual
 (`0.15·tanh(·)`) or, in the MPPI variant, a bounded model-predictive
-refinement (≤ 2 % attitude, ≤ 0.5 % throttle) that is switched off per
-environment once a fault is latched, because the world model does not know
-about the fault.
+refinement (≤ 2 % attitude, ≤ 0.5 % throttle).  The MPPI stays active under
+a latched fault: the deviation is then restricted to a ±0.5 % trust region
+around the policy prior and the plan is only applied where the world
+model's own value prefers it over the prior (greedy acceptance), because the
+world model does not know about the fault and cannot be trusted blindly.
 
 ---
 
@@ -199,7 +222,7 @@ uv pip install --python .venv/bin/python -e ".[dev]" numpy matplotlib typer pyya
 # fast unit tests (~6 s)
 .venv/bin/python -m pytest tests -q -m "not slow"
 
-# the published benchmark (~27 min on an RTX 4060) -> results/eval_results.json
+# the published benchmark (~33 min on an RTX 4060) -> results/eval_results.json
 PYTHONPATH=. .venv/bin/python -m eval.benchmark_fdir --episodes 20 --fast-mppi
 
 # the four-panel telemetry figure
@@ -212,7 +235,7 @@ PYTHONPATH=. .venv/bin/python scripts/gate_report.py results/eval_results.json
 ```
 
 **Checkpoints.**  The trained world model and the PPO baseline are attached
-to the [v1.0.0 release](https://github.com/Shushant17711/AeroWM-FDIR/releases/tag/v1.0.0)
+to the [v1.1.0 release](https://github.com/Shushant17711/AeroWM-FDIR/releases/tag/v1.1.0)
 (`checkpoint_final.pt`, `ppo.pt`).  The benchmark and the figure load them by
 default; pass `--wm-checkpoint` / `--ppo-checkpoint` to use your own.  With
 untrained weights the FDIR variants score ~0 % — the harness reports exactly
@@ -269,28 +292,31 @@ implement.
 
 ## 6. What the baseline cannot do
 
-*And where the numbers come from.*  The classical reference is deliberately **non-adaptive**: it never inspects
-the actuator state and it is not told the fault.  It lands 95 % of the
-nominal flights and 0-40 % of the faulted ones, and the variation between
-protocols is explained, not hidden:
+*And where the numbers come from.*  The classical reference is deliberately
+**non-adaptive**: it never inspects the actuator state and it is not told the
+fault.  It lands 100 % of the nominal flights and 0-10 % of the faulted ones:
 
 | protocol | nominal | LOE | bias | stuck | CoM |
 | :-- | --: | --: | --: | --: | --: |
-| benchmark sample (20 eps, onset 150) | 95 % | 15 % | 0 % | 40 % | 0 % |
-| independent sample (20 eps, onset 150) | 95 % | 19 % | 0 % | 40 % | 0 % |
-| unit-test protocol (48/16 eps, onset 60) | 97.9 % | 12.5 % | 0 % | **0 %** | 6.3 % |
+| benchmark sample (20 eps, onset 150) | 100 % | 5 % | 0 % | 0 % | 10 % |
+| unit-test protocol (48/16 eps, onset 60) | 97.9 % | 12.5 % | 0 % | 0 % | 6.3 % |
 
-The `GIMBAL_STUCK` rate is set by the *freeze-angle draw*, not by the
-controller.  A seized TVC freezes at whatever angle it held at the onset, so
-a freeze within 1° of the vertical is an almost healthy flight.  Measured
-directly (`scripts/stuck_freeze_angle.py`, 20 episodes): the classical law
-lands **4/4** benign freezes and **0/16** severe ones.  The FDIR stack is
-insensitive to that draw because it *measures* the frozen servo and hands the
-axis over to the backup ACS: 95 % on the same episodes.
+The `GIMBAL_STUCK` mode deserves a word, because it used to carry a caveat.
+A TVC that seizes *within a fraction of a degree of the vertical* does not
+degrade the flight at all — the vehicle keeps descending on an essentially
+vertical thrust vector and lands next to the pad.  Such an episode is a
+healthy flight with a jammed actuator, not a fault, and including it in the
+fault model would have measured the freeze-angle draw instead of the
+controller.  The fault model therefore locks the seized axis at a deflection
+of at least `1.25° · (severity / 0.5)` from the vertical
+(`FaultInjectionSchema.stuck_min_deflection_deg`), and the classical law now
+lands **0 %** of the `GIMBAL_STUCK` flights.  The FDIR stack is unaffected
+by this choice: it *measures* the frozen servo and hands the axis over to the
+backup ACS, so it recovers a lock wherever it sits.
 
-`results/TRAINING_REPORT.md` §9 contains the full measurement trail,
-including the five defects that were open when Revision 5 was published, the
-mechanism behind each of them, and the sweeps that closed them.
+`results/TRAINING_REPORT.md` §10 contains the full measurement trail of that
+revision (the benign-freeze closure, the false-alarm analysis, the two
+isolation defects it exposed and the audits over 305 episodes).
 
 ---
 
@@ -298,9 +324,12 @@ mechanism behind each of them, and the sweeps that closed them.
 
 * Every published number is produced by a command in
   [`docs/REPRODUCTION.md`](docs/REPRODUCTION.md); nothing is hard-coded.
-* The benchmark is deterministic given the seed, the flags and the code path
-  (the observation noise is drawn from the global torch RNG — a wart, noted in
-  `LIMITATIONS.md` §5).
+* The benchmark is deterministic given the seed and the flags: the episode
+  scenario and the observation noise are drawn from a **counter-based hash**
+  of `(seed, environment index, episode counter)`, so they never depend on
+  the global torch RNG and never on the order in which the controllers are
+  evaluated.  Episode *k* of environment *i* is the same flight for every
+  controller.
 * Training is not bit-exact reproducible (cuDNN autotuning, non-deterministic
   GPU reductions), so the release ships the exact checkpoints that produced
   the published numbers.
@@ -318,6 +347,14 @@ fault, 20 episodes per mode from a single seed on a benchmark that was also
 used for tuning, and a classical baseline that is competent but not
 state-of-the-art.
 
+The published figure is a good illustration of the distinction between the
+*score* and the *alarm*: the nominal curve of Panel 2 crosses the score
+threshold in 0.6 % of the samples (the world model's prediction error grows
+during the terminal transients), but the alarm — which additionally requires
+physical evidence and two consecutive samples — is never raised on a nominal
+flight.  The markers in Panel 2 show the samples on which the alarm actually
+fired.
+
 ---
 
 ## 9. Citation
@@ -330,7 +367,7 @@ state-of-the-art.
             detection, isolation and recovery for 6-DOF powered descent},
   author = {Shushant},
   year   = {2026},
-  version = {1.0.0},
+  version = {1.1.0},
   url    = {https://github.com/Shushant17711/AeroWM-FDIR},
   doi    = {10.5281/zenodo.0000000},   % placeholder: register on first release
   note   = {Research software; MIT licensed}

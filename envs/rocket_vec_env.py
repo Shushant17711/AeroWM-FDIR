@@ -19,12 +19,15 @@ from configs.schema import (
     ActionSchema,
     EnvironmentConfig,
     FaultInjectionSchema,
+    FaultMode,
+    FaultParamsLayout,
     ObservationSchema,
     RewardConfig,
     RocketPhysicsConfig,
 )
 from envs.base_types import EnvResetReturn, EnvStepReturn, FaultState
-from envs.fault_injector import FaultInjector
+from envs.counter_rng import derive_seed, hash_normal, hash_uniform
+from envs.fault_injector import FaultInjector, stuck_lock_deflections
 from envs.quaternion_ops import quat_from_axis_angle, quat_multiply, quat_normalize, quat_tilt_cosine
 from envs.rk4_integrator import rk4_step
 from envs.rocket_dynamics import atmosphere_density, compute_derivatives
@@ -83,6 +86,25 @@ class VectorizedRocketEnv:
         self.generator = generator
         self._phase = 0  # deterministic draw counter for the RNG stream
 
+        # ------------------------------------------------------------------ #
+        # Episode-local randomness
+        # ------------------------------------------------------------------ #
+        # The observation noise and the episode scenario must be reproducible
+        # *per episode*: they may not depend on how many observations the
+        # previous episodes produced, otherwise a benchmark result changes
+        # when the controllers are evaluated in a different order.  The
+        # dedicated ``_obs_rng`` owns the noise stream (it never touches the
+        # global torch RNG) and every episode derives its own seeds from
+        # (base seed, environment index, episode counter) through a
+        # counter-based hash.
+        self._obs_rng = torch.Generator(device=self.device)
+        self._obs_rng.manual_seed(int(seed) + 0x5EED_0B5E)
+        self._scenario_base = int(seed)
+        self._fault_base = int(seed) ^ 0x0BAD_C0DE
+        self._episode_key = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._episode_seed = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._fault_seed = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
         self.injector = FaultInjector(self.fault_cfg, self.physics, self.device, generator)
 
         # Mutable per-environment buffers (persistent, never reallocated).
@@ -126,9 +148,20 @@ class VectorizedRocketEnv:
         onset: Optional[torch.Tensor | int] = None,
         severity: Optional[torch.Tensor | float] = None,
         probability: Optional[float] = None,
+        seed: Optional[int] = None,
     ) -> EnvResetReturn:
-        """Reset all (or a masked subset) of the environments."""
+        """Reset all (or a masked subset) of the environments.
+
+        ``seed`` reseeds the episode-local randomness (scenario + observation
+        noise).  It is the handle a benchmark harness uses to give every
+        controller *the same* scenarios: the scenario and the noise of
+        episode ``k`` are a pure function of ``(seed, environment index,
+        episode counter)`` and therefore independent of the order in which
+        the controllers are evaluated.
+        """
         dev = self.device
+        if seed is not None:
+            self._reseed(int(seed))
         if mask is None:
             mask = torch.ones(self.num_envs, dtype=torch.bool, device=dev)
         else:
@@ -137,6 +170,11 @@ class VectorizedRocketEnv:
             return EnvResetReturn(self._observation(), self._info())
 
         n = int(mask.sum())
+        env_index = torch.nonzero(mask, as_tuple=False).flatten()
+        episode_key = self._episode_key[mask]
+        self._episode_seed[mask] = derive_seed(self._scenario_base, env_index, episode_key)
+        self._fault_seed[mask] = derive_seed(self._fault_base, env_index, episode_key)
+
         if mode is None and self.fixed_fault_mode is not None:
             mode = torch.full((n,), int(self.fixed_fault_mode), dtype=torch.long, device=dev)
         if mode is None and self.balanced_fault_mix:
@@ -152,8 +190,14 @@ class VectorizedRocketEnv:
         lo_vz, hi_vz = self.env_cfg.initial_descent_rate
         lo_vxy, hi_vxy = self.env_cfg.initial_lateral_rate
 
+        seed_vec = self._episode_seed[mask]
+        counter = torch.zeros((), dtype=torch.long, device=dev)
+
         def uniform(lo: float, hi: float) -> torch.Tensor:
-            return torch.rand(n, device=dev, generator=self.generator) * (hi - lo) + lo
+            nonlocal counter
+            counter = counter + 1
+            u = hash_uniform(seed_vec, counter.expand(n))
+            return u.to(self.dtype) * (hi - lo) + lo
 
         r = torch.stack([uniform(lo_xy, hi_xy), uniform(lo_xy, hi_xy), uniform(lo_a, hi_a)], dim=-1)
         v = torch.stack(
@@ -202,6 +246,7 @@ class VectorizedRocketEnv:
             onset=expand(onset, torch.long),
             severity=expand(severity, torch.float),
             probability=probability if probability is not None else self._effective_fault_probability(),
+            seed=self._fault_seed[mask],
         )
         self.fault = FaultState(
             mode=self._scatter(self.fault.mode, fresh.mode, mask),
@@ -210,13 +255,59 @@ class VectorizedRocketEnv:
             active=self._scatter(self.fault.active, fresh.active, mask),
             params=self._scatter(self.fault.params, fresh.params, mask),
         )
+        # The next episode of these environments gets a fresh key.
+        self._episode_key[mask] = episode_key + 1
         return EnvResetReturn(self._observation(), self._info())
+
+    def _reseed(self, seed: int) -> None:
+        """Reseed the episode-local randomness (scenario + observation noise)."""
+        self._obs_rng.manual_seed(int(seed) + 0x5EED_0B5E)
+        self._scenario_base = int(seed)
+        self._fault_base = int(seed) ^ 0x0BAD_C0DE
+        self._episode_key.zero_()
+        self.generator.manual_seed(int(seed))
 
     @staticmethod
     def _scatter(old: torch.Tensor, new: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         out = old.clone()
         out[mask] = new.to(old.dtype)
         return out
+
+    # ------------------------------------------------------------------ #
+    # Fault actuation
+    # ------------------------------------------------------------------ #
+    def _seize_stuck_axes(self, was_active: torch.Tensor) -> None:
+        """Lock a newly seized TVC axis at a meaningful deflection.
+
+        A gimbal that freezes at (almost) the vertical does not degrade the
+        flight, so such an episode measures the freeze-angle draw instead of
+        the controller.  The fault model therefore locks the seized axis at
+        the pre-fault deflection, floored at
+        ``stuck_min_deflection_deg * (severity / 0.5)`` from the vertical.
+
+        The lock is a *mechanical* engagement: the actuator jumps to the lock
+        angle once, at the onset step, and the plant then holds it (a seized
+        axis ignores the command), which is exactly the freeze-in-place
+        behaviour of :func:`envs.rocket_dynamics.actuator_commands`.
+        """
+        newly = (
+            self.fault.active
+            & (~was_active)
+            & (self.fault.mode == int(FaultMode.GIMBAL_STUCK))
+        )
+        if not bool(newly.any()):
+            return
+        lock = stuck_lock_deflections(
+            self.state[:, 14:16],
+            self.fault.severity,
+            self.fault_cfg.stuck_min_deflection_deg,
+        )
+        stuck_y = self.fault.params[:, FaultParamsLayout.STUCK_Y] > 0.5
+        stuck_z = self.fault.params[:, FaultParamsLayout.STUCK_Z] > 0.5
+        gimbal = self.state[:, 14:16].clone()
+        gimbal[:, 0] = torch.where(newly & stuck_y, lock[:, 0], gimbal[:, 0])
+        gimbal[:, 1] = torch.where(newly & stuck_z, lock[:, 1], gimbal[:, 1])
+        self.state[:, 14:16] = gimbal
 
     # ------------------------------------------------------------------ #
     # Step
@@ -229,7 +320,13 @@ class VectorizedRocketEnv:
 
         # 1. Schedule faults, integrate physics.  ``onset`` is 1-based: a
         #    fault with onset=5 is applied during the 5th environment step.
+        was_active = self.fault.active
         self.fault = self.injector.update(self.fault, self.step_count + 1)
+        # A gimbal that seizes *at* the vertical is not a fault (the vehicle
+        # keeps flying on an essentially vertical thrust vector), so the
+        # seized axis is locked at a deflection of at least
+        # ``stuck_min_deflection_deg`` (see envs.fault_injector).
+        self._seize_stuck_axes(was_active)
         self.state = rk4_step(
             compute_derivatives,
             self.state,
@@ -317,8 +414,25 @@ class VectorizedRocketEnv:
             dim=-1,
         )
         if self.obs_noise_std > 0.0:
-            obs = obs + torch.randn_like(obs) * self.obs_noise_std
+            obs = obs + self._observation_noise(obs)
         return obs
+
+    def _observation_noise(self, obs: torch.Tensor) -> torch.Tensor:
+        """Per-episode reproducible observation noise.
+
+        The noise of step ``t`` is a pure function of ``(episode seed, step,
+        channel)``: it is drawn from the dedicated observation-noise stream
+        (never the global torch RNG) and it does not depend on how many
+        observations the previous episodes produced, so a benchmark result
+        cannot change when the controllers are evaluated in a different
+        order.
+        """
+        dim = obs.shape[-1]
+        step = self.step_count.to(torch.int64).unsqueeze(-1)
+        channel = torch.arange(dim, device=obs.device, dtype=torch.int64).unsqueeze(0)
+        counter = step * dim + channel
+        noise = hash_normal(self._episode_seed.unsqueeze(-1), counter)
+        return noise.to(obs.dtype) * self.obs_noise_std
 
     # ------------------------------------------------------------------ #
     # Reward

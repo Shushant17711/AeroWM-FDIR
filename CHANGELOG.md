@@ -4,6 +4,59 @@ All notable changes to this project are documented here.  The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-10-21
+
+Revision 7: the three open items of revision 6 are closed, and the two
+measurement caveats (the benign freeze and the nominal false alarms) are
+removed from the fault model and from the detector.
+
+### Added
+
+* **Minimum seizure angle** (`envs/fault_injector.py`,
+  `FaultInjectionSchema.stuck_min_deflection_deg`): a `GIMBAL_STUCK` fault
+  locks the seized axis at at least `radians(1.25) * (severity / 0.5)` from
+  the vertical, so the fault model no longer contains "faults" that do not
+  degrade the flight at all.
+* **Seizure lock** (`envs/rocket_vec_env.py`): the environment applies the
+  lock at the onset step; the plant keeps its freeze-in-place semantics.
+* **Per-episode randomness** (`envs/counter_rng.py`): a counter-based hash
+  (SplitMix64) makes the episode scenario and the observation noise a pure
+  function of `(seed, environment index, episode counter)`.
+* **`false_alarm_rate`** in the benchmark output: the fraction of episodes
+  that raise an alarm outside the detection window (before the onset for a
+  faulted episode, anywhere for a nominal one).
+* **Greedy trust-region acceptance** for the MPPI variant
+  (`agents/residual_control.py`): the planner stays active under a latched
+  fault inside a 0.5 % trust region, and the plan is only applied where the
+  world model's own value prefers it over the policy prior.
+
+### Changed
+
+* The anomaly score now scores only the six *physics* residual channels; the
+  command-tracking channels are large during any fast transient (the engine
+  spooling down in the terminal phase reaches 6 sigma) and are not a fault
+  signature.  They are still part of the isolation head's input.
+* The alarm requires *physical* evidence (a residual, a frozen servo or a CoM
+  offset) and two consecutive samples above the threshold, and it is
+  suppressed during the first samples of an episode and across an
+  auto-reset.
+* The frozen-servo test is confirmed over four consecutive bit-stationary
+  samples, which separates a seized axis from a biased one without a
+  mis-isolation.
+* The isolation evidence is used instantaneously instead of a 250-step
+  moving average: the class is now decided 7 samples after the onset instead
+  of 65-90.
+
+### Fixed
+
+* A `GIMBAL_BIAS` episode could be isolated as `GIMBAL_STUCK` (the frozen
+  test also fired on a converged, biased servo).
+* A `GIMBAL_STUCK` episode could be latched as `COM_SHIFT` (the CoM
+  attribution used the smoothed residuals, which lag the fault onset); the
+  class is now latched from the instantaneous actuator residuals.
+* The nominal false alarms: the episode-boundary jump and the terminal-phase
+  transients no longer raise an alarm (measured false-alarm rate: 0 %).
+
 ## [1.0.0] - 2026-10-21
 
 First public research release.  All four verification gates pass on the

@@ -28,6 +28,52 @@ from agents.pid_baseline import CascadePIDController
 from configs.schema import ActionSchema, FaultParamsLayout
 from models.world_model import RocketWorldModel
 
+# Number of samples the alarm has to stay above the threshold before it is
+# raised.  A single sample above the threshold is produced by the
+# controller's own discrete mode switches (the 50 m reposition gate and the
+# terminal flare), which are *not* faults; requiring two consecutive samples
+# removes them at the cost of one sample of detection latency.
+ALARM_CONFIRM_STEPS = 2
+
+# Number of samples at the beginning of an episode during which no alarm is
+# raised.  The recurrent state of the world model is not meaningful yet (the
+# first sample has no predecessor, so the one-step residuals are undefined),
+# and the anomaly score of the first samples is dominated by that transient
+# rather than by the plant.
+ALARM_WARMUP_STEPS = 20
+
+# The alarm needs *physical* evidence.  The learned part of the anomaly score
+# (the observation innovation of the world model) reaches 3-4 sigma during
+# the controller's own fast transients -- the engine spooling down in the
+# terminal phase, the 50 m reposition gate -- and would raise an alarm on a
+# perfectly healthy vehicle.  The exact one-step physics residuals do not:
+# in nominal flight their score is 0.019 (median) and never exceeds it
+# outside an episode boundary, while a fault pushes it above 1.5 within a
+# single sample.
+RESIDUAL_TRIGGER = 0.5
+COM_TRIGGER = 0.5
+# The physical evidence is a single-sample measurement (in nominal flight the
+# residual score is 0.019 and never leaves it outside an episode boundary),
+# so it does not need its own confirmation: the two-sample debounce of the
+# alarm already rejects a one-sample excursion.
+TRIGGER_CONFIRM_STEPS = 1
+
+# Number of samples a gimbal-class decision (bias or stuck) is held back
+# while the frozen-servo test has not resolved yet.  A seized axis shows a
+# bias-like residual in the samples in which it is still settling, so the
+# class must not be decided from the argmax alone; the frozen confirmation
+# overrides it as soon as it arrives.
+GIMBAL_CLASS_HOLD_STEPS = 5
+
+# Trust region of the MPPI refinement while a fault is latched [action
+# units].  The world model does not know about the fault, so the plan may
+# only *nudge* the fault-conditioned law (0.5 % of the action range) and it
+# is only accepted where the model's own value prefers it.
+LATCHED_PLANNER_SCALE = 0.005
+# Minimum value improvement (in the model's normalised return) that a plan
+# has to show over the policy prior before it is accepted.
+PLAN_ACCEPT_MARGIN = 0.0
+
 
 class EstimatedFaultState:
     """Minimal ``FaultState``-compatible container for predicted parameters."""
@@ -235,6 +281,21 @@ class FDIRResidualController(ControllerMixin):
         self.cls_prev = torch.zeros(batch_size, dtype=torch.long, device=self.device)
         self.com_streak = torch.zeros(batch_size, dtype=torch.long, device=self.device)
         self.frozen_seen = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+        # Alarm debounce: the alarm is raised only after the surprise has
+        # stayed above the threshold for ALARM_CONFIRM_STEPS consecutive
+        # samples.  A single-sample excursion is produced by the controller's
+        # own discrete mode switches (the 50 m reposition gate, the terminal
+        # flare) and is not a fault.
+        self.alarm_streak = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        self.trigger_streak = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        self.alarm = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+        self.step_index = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        # Environments that were auto-reset by the environment: the next
+        # sample of such an environment compares a fresh observation with the
+        # terminal observation of the previous episode, which is a huge
+        # (and entirely artificial) residual and innovation.  The alarm of
+        # that sample is therefore suppressed.
+        self.skip_alarm = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
         self.last_debug = {}
         self.base.reset(batch_size, self.device)
         if hasattr(self.model, 'fdir'):
@@ -263,6 +324,11 @@ class FDIRResidualController(ControllerMixin):
         self.cls_prev[mask] = 0
         self.com_streak[mask] = 0
         self.frozen_seen[mask] = False
+        self.alarm_streak[mask] = 0
+        self.trigger_streak[mask] = 0
+        self.alarm[mask] = False
+        self.step_index[mask] = 0
+        self.skip_alarm[mask] = True
         if self.prev_obs is not None:
             self.prev_obs = self.prev_obs.clone()
             self.prev_obs[mask] = 0.0
@@ -287,6 +353,12 @@ class FDIRResidualController(ControllerMixin):
         # a_{t-1}) pair yet, and a zero action maps to *minimum thrust*, so
         # inventing one produces a large spurious residual.
         obs_prev = self.prev_obs
+        # A jump in the position is an auto-reset, not a plant behaviour.  The
+        # residual and the innovation of that sample are artefacts of the
+        # episode boundary and must not raise an alarm.
+        if obs_prev is not None:
+            jump = (obs[:, :3] - obs_prev[:, :3]).abs().amax(dim=-1) > 0.05
+            self.skip_alarm = self.skip_alarm | jump
         signals = self.model.fault_head(
             self.h,
             self.z,
@@ -309,6 +381,17 @@ class FDIRResidualController(ControllerMixin):
         self.com_estimate = signals.com_estimate
         self.c = signals.context if self.use_fdir else torch.zeros_like(signals.context)
         self.prev_obs = obs.detach()
+        # Components of the anomaly score, kept for diagnostics (the figure
+        # and the false-alarm analysis need to know *which* part of the score
+        # fired: the learned innovation or the exact physics residual).
+        self.score_parts = {
+            "kl": signals.kl,
+            "innovation": signals.innovation,
+            "residual": signals.residual_score,
+            "frozen": signals.frozen_instant,
+            "com": signals.com_score,
+            "raw": signals.raw_features,
+        }
 
     @torch.no_grad()
     def act(self, obs: torch.Tensor, fault_context=None) -> torch.Tensor:
@@ -319,7 +402,46 @@ class FDIRResidualController(ControllerMixin):
 
         # --- fault-class latch (see __init__) --------------------------- #
         threshold = float(self.model.fdir.detector.threshold)
-        alarm = self.surprise > threshold
+        # Physical evidence: the exact one-step residuals, the frozen-servo
+        # test and the CoM offset.  The learned part of the score (the
+        # observation innovation) is not allowed to raise an alarm on its own
+        # -- it reaches several sigma during the controller's own fast
+        # transients on a perfectly healthy vehicle.
+        residual_score = self.score_parts["residual"]
+        frozen_inst = self.score_parts["frozen"]
+        com_score = self.score_parts["com"]
+        trigger = (
+            (residual_score > RESIDUAL_TRIGGER)
+            | (frozen_inst.amax(dim=-1) > 0.5)
+            | (com_score > COM_TRIGGER)
+        )
+        self.trigger_streak = torch.where(
+            trigger, self.trigger_streak + 1, torch.zeros_like(self.trigger_streak)
+        )
+        physical = self.trigger_streak >= TRIGGER_CONFIRM_STEPS
+        above = (self.surprise > threshold) & physical
+        # Debounce: the alarm needs two consecutive samples above the
+        # threshold.  The controller's own discrete mode switches (the 50 m
+        # reposition gate, the terminal flare) produce a single-sample
+        # excursion of the anomaly score, which is not a fault.
+        #
+        # The first samples of an episode are excluded as well: the
+        # recurrent state is still warming up there, so the score measures
+        # the model, not the plant.
+        warming_up = self.step_index < ALARM_WARMUP_STEPS
+        above = above & (~warming_up)
+        self.step_index = self.step_index + 1
+        self.alarm_streak = torch.where(
+            above, self.alarm_streak + 1, torch.zeros_like(self.alarm_streak)
+        )
+        self.alarm = self.alarm_streak >= ALARM_CONFIRM_STEPS
+        # An auto-reset produces one sample in which the observation jumps
+        # from the terminal state of the previous episode to a fresh one.
+        # The residual and the innovation of that sample are artefacts of
+        # the reset, not of the plant, so the alarm is suppressed.
+        self.alarm = self.alarm & (~self.skip_alarm)
+        self.skip_alarm = torch.zeros_like(self.skip_alarm)
+        alarm = self.alarm
         self.detected = self.detected | alarm
         self.detect_age = torch.where(
             self.detected, self.detect_age + 1, torch.zeros_like(self.detect_age)
@@ -339,7 +461,16 @@ class FDIRResidualController(ControllerMixin):
             # produces an unexplained torque, which would masquerade as a CoM
             # shift.  Require the actuator residuals and the frozen test to be
             # nominal before attributing torque to the CoM.
-            act_z = self.model.fdir.residuals.normalize(self.features)
+            #
+            # The test uses the *instantaneous* (unsmoothed) residuals: the
+            # smoothed ones lag the fault onset by a few samples, and during
+            # that window the CoM attribution would win the race against the
+            # frozen-servo confirmation (measured: the CoM class was latched
+            # for a GIMBAL_STUCK episode, whose compensation is a trim instead
+            # of the ACS takeover -- the vehicle then tipped over).
+            raw = self.score_parts.get("raw")
+            act_src = raw if raw is not None else self.features
+            act_z = self.model.fdir.residuals.normalize(act_src)
             act_ok = (act_z[..., 0:3].abs().amax(dim=-1) < 3.0) & (
                 self.frozen.amax(dim=-1) < 0.5
             )
@@ -372,8 +503,35 @@ class FDIRResidualController(ControllerMixin):
             & (self.detect_age >= 2)
             & (self.cls_streak >= 2)
             & (cls_now != 0)
+            # The CoM class is only latched through its dedicated path
+            # (take_com), which requires the *physical* evidence of a centre
+            # of mass offset with healthy actuators.  Letting the argmax latch
+            # it would attribute a CoM shift to a gimbal fault whenever the
+            # fault transient inflates the CoM estimate (measured: a
+            # GIMBAL_STUCK episode latched as CoM and the vehicle tipped over
+            # instead of handing the axis over to the backup ACS).
+            & (cls_now != 4)
             & ~take_com
         )
+        # A gimbal-class decision (bias or stuck) waits for the frozen-servo
+        # test to resolve.  A seized axis shows a *bias-like* residual while
+        # it is still settling (or while the lock engages), so the argmax
+        # alone would latch "bias" for a stuck fault.  The decision is taken
+        # as soon as the frozen test confirms a lock (take_frozen), or after
+        # GIMBAL_CLASS_HOLD_STEPS samples, when the axis has demonstrably
+        # kept tracking the command and the fault is a bias.
+        if self.features is not None:
+            gimbal_z = self.model.fdir.residuals.normalize(self.features)[..., 0:2]
+            gimbal_sig = gimbal_z.abs().amax(dim=-1) > 5.0
+        else:
+            gimbal_sig = torch.zeros_like(cls_now, dtype=torch.bool)
+        gimbal_pending = (
+            gimbal_sig
+            & (self.frozen.amax(dim=-1) < 0.5)
+            & (self.detect_age <= GIMBAL_CLASS_HOLD_STEPS)
+            & (cls_now != 1)  # the thrust-loss class has no gimbal signature
+        )
+        take = take & ~gimbal_pending
         new_cls = torch.where(take_com, torch.full_like(cls_now, 4), cls_now)
         new_cls = torch.where(take_frozen, torch.full_like(cls_now, 3), new_cls)
         take_any = take | take_com | take_frozen
@@ -418,28 +576,33 @@ class FDIRResidualController(ControllerMixin):
             # the anchor is the *absolute* action the prior implies.
             anchor = (u_base + delta_policy).clamp(-1.0, 1.0)
             planned = self.planner.act(obs, anchor=anchor, latent=(self.h, self.z, self.c))
-            # A latched fault means the base law is carrying the precision
-            # compensation (bias / CoM cancellation, thrust re-scaling) and the
-            # world model does not know about the fault, so the planner must
-            # not perturb the actuator: its deviation is switched off *per
-            # environment* (an episode that has latched a fault hands the
-            # actuator back to the fault-conditioned law, while a nominal
-            # episode in the same batch keeps the full planner refinement).
+            # Trust region.  While no fault is latched the planner may move
+            # the command by the full planner_scale.  Once a fault is latched
+            # the world model does not know about the fault, so the plan may
+            # only *nudge* the fault-conditioned law (0.5 % of the action
+            # range): the deviation is bounded per environment, and it is
+            # only kept where the model's own value prefers it (see
+            # ``_plan_is_better``).  The planner therefore stays active under
+            # a fault instead of being switched off.
             latched = self.cls_set.to(planned.dtype).unsqueeze(-1)
-            att_scale = (1.0 - latched) * float(self.planner_scale)
-            thr_scale = (1.0 - latched) * float(self.planner_scale) * 0.25
+            att_limit = latched * LATCHED_PLANNER_SCALE + (1.0 - latched) * float(
+                self.planner_scale
+            )
+            thr_limit = att_limit * 0.25
             # Only the two attitude channels are delegated: the throttle sets
             # the descent profile and is far more sensitive to plan noise, so
             # it stays on the base law (bounded refinement).
             raw = planned - anchor
             delta = torch.cat(
                 [
-                    raw[..., :2].clamp(-att_scale, att_scale),
-                    raw[..., 2:3].clamp(-thr_scale, thr_scale),
+                    raw[..., :2].clamp(-att_limit, att_limit),
+                    raw[..., 2:3].clamp(-thr_limit, thr_limit),
                 ],
                 dim=-1,
             )
-            action = (anchor + delta).clamp(-1.0, 1.0)
+            candidate = (anchor + delta).clamp(-1.0, 1.0)
+            accept = self._plan_is_better(anchor, candidate)
+            action = torch.where(accept.unsqueeze(-1), candidate, anchor)
         else:
             delta = delta_policy
             action = (u_base + delta).clamp(-1.0, 1.0)
@@ -450,5 +613,24 @@ class FDIRResidualController(ControllerMixin):
             "fault_params": self.fault_params,
             "u_base": u_base,
             "delta": delta,
+            "alarm": self.alarm,
         }
         return action
+
+    @torch.no_grad()
+    def _plan_is_better(self, anchor: torch.Tensor, candidate: torch.Tensor) -> torch.Tensor:
+        """Greedy value acceptance: does the world model prefer the plan?
+
+        The model's own (fault-conditioned) action value is evaluated at the
+        planned action and at the policy prior.  The plan is only kept where
+        it improves the value by more than ``PLAN_ACCEPT_MARGIN``; elsewhere
+        the fault-conditioned law keeps the actuator.  This is what makes it
+        safe to leave the planner active while a fault is latched: the world
+        model does not know about the fault, so its advice is only trusted
+        where it is actually better than doing nothing.
+        """
+        q_anchor = self.model.q_values(self.h, self.z, self.c, anchor)
+        q_candidate = self.model.q_values(self.h, self.z, self.c, candidate)
+        v_anchor = torch.minimum(q_anchor[0], q_anchor[1])
+        v_candidate = torch.minimum(q_candidate[0], q_candidate[1])
+        return v_candidate > v_anchor + PLAN_ACCEPT_MARGIN

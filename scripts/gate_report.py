@@ -58,6 +58,12 @@ def main() -> None:
             f"({mean_lat * 20:.1f} ms) <= 3: {'PASS' if mean_lat <= 3.0 else 'FAIL'}, "
             f"isolation {mean_iso * 100:.1f} % >= 92: {'PASS' if mean_iso >= 0.92 else 'FAIL'}"
         )
+        fa = per_mode["NOMINAL"].get("false_alarm_rate")
+        if fa is not None:
+            print(
+                f"Gate 3  {name:22s} nominal false alarms {fa * 100:.1f} % "
+                f"<= 5: {'PASS' if fa <= 0.05 else 'FAIL'}"
+            )
 
     # Gate 4 -- FDIR stack lands >= 85 % in every mode.
     for name, per_mode in results.items():

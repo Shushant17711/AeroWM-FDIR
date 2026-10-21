@@ -156,6 +156,9 @@ class FDIRSignals:
     head_inputs: Optional[torch.Tensor] = None
     bias_estimate: Optional[torch.Tensor] = None
     com_estimate: Optional[torch.Tensor] = None
+    frozen_instant: Optional[torch.Tensor] = None
+    com_score: Optional[torch.Tensor] = None
+    raw_features: Optional[torch.Tensor] = None
 
 
 class FDIRModule(nn.Module):
@@ -316,14 +319,23 @@ class FDIRModule(nn.Module):
         # forgotten when the controller masks it later in the episode.  In
         # eval mode the prior evidence is peak-held with a slow decay; during
         # training the instantaneous prior is used (sequences are independent).
+        # Faults are latched by the *controller* (see
+        # agents.residual_control.FDIRResidualController): the class is
+        # decided once, from the evidence of the onset, and never rewritten.
+        # The evidence itself is used instantaneously here.  An earlier
+        # version smoothed it with a 250-step moving average and a peak-hold,
+        # which delayed the class decision by 65-90 samples after the onset
+        # (measured) -- the whole onset signature lives in the first few
+        # samples, so an average cannot reveal it quickly -- and a peak-hold
+        # on top of it kept a transient command-tracking excursion as the
+        # class of the whole episode.
         if not self.training:
             if self._evidence_peak is None or self._evidence_peak.shape != prior.shape:
                 self._evidence_peak = prior.detach().clone()
             else:
-                # Slow evidence average (~250 steps): a fault seen early in the
-                # episode stays classified even after the controller masks it.
+                # Kept only for diagnostics / backward compatibility.
                 self._evidence_peak = 0.996 * self._evidence_peak + 0.004 * prior.detach()
-            prior = self._evidence_peak.to(prior.dtype)
+        prior = prior.to(prior.dtype)
         # Bound the learned head so a poorly-calibrated training run cannot
         # override the physics prior (which is the deterministic part).
         head_logits = 3.0 * torch.tanh(out[..., : self.cfg.num_fault_classes] / 3.0)
@@ -343,6 +355,9 @@ class FDIRModule(nn.Module):
             head_inputs,
             bias_estimate,
             com_estimate,
+            frozen_instant,
+            com_score,
+            raw_residuals,
         )
 
 

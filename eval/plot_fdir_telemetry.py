@@ -33,6 +33,7 @@ def record_episode(
     obs = env._observation()
     log = {k: [] for k in ("t", "x", "y", "z", "vz", "tilt", "gimbal_y", "gimbal_z", "throttle", "surprise")}
     probs = []
+    alarms = []
     for t in range(env.env_cfg.max_episode_steps):
         action = controller.act(obs)
         out = env.step(action)
@@ -51,13 +52,19 @@ def record_episode(
             log["surprise"].append(float(controller.surprise[0]))
             logits = controller.last_debug.get("fault_logits")
             probs.append(torch.softmax(logits[0].float(), dim=-1).cpu().numpy() if logits is not None else np.zeros(5))
+            alarm = getattr(controller, "alarm", None)
+            alarms.append(bool(alarm[0]) if alarm is not None else False)
         else:
             log["surprise"].append(0.0)
             probs.append(np.zeros(5))
+            alarms.append(False)
         if (out.terminated | out.truncated).any():
+            if hasattr(controller, "reset_mask"):
+                controller.reset_mask(out.terminated | out.truncated)
             break
     data = {k: np.asarray(v) for k, v in log.items()}
     data["probs"] = np.asarray(probs)
+    data["alarm"] = np.asarray(alarms)
     data["fault_onset"] = onset * env.physics.dt
     data["mode"] = mode
     data["threshold"] = threshold
@@ -93,6 +100,11 @@ def plot_fdir_telemetry(
     # signature ~10^2), so the axis is logarithmic -- otherwise the calibrated
     # alarm threshold is invisible next to the fault transient.
     ax2.set_yscale("log")
+    # The detector's warm-up (the first samples of the episode, where the
+    # recurrent state of the world model is not meaningful yet) is shaded:
+    # the score is high there, the alarm is not raised.
+    warmup = 20 * 0.02
+    ax2.axvspan(0.0, warmup, color="0.85", zorder=0, label="detector warm-up")
     ax2.plot(nominal["t"], np.maximum(nominal["surprise"], 1e-3), color="#4C72B0",
               lw=1.0, label="Nominal $S_t$")
     ax2.plot(fault["t"], np.maximum(fault["surprise"], 1e-3), color="#C44E52",
@@ -101,10 +113,19 @@ def plot_fdir_telemetry(
         ax2.axhline(max(fault["threshold"], 1e-3), color="k", ls="--", lw=1,
                     label=r"$\tau_{alarm}$")
     ax2.axvline(fault["fault_onset"], color="gray", ls=":", label="fault onset")
+    # The samples on which the detector actually raised an alarm.
+    for data, colour, marker in ((nominal, "#4C72B0", "o"), (fault, "#C44E52", "o")):
+        alarm = np.asarray(data.get("alarm", np.zeros(1)))
+        if alarm.any():
+            ax2.plot(
+                np.asarray(data["t"])[alarm],
+                np.maximum(np.asarray(data["surprise"])[alarm], 1e-3),
+                marker, color=colour, ms=4, ls="none", label="alarm raised",
+            )
     ax2.set_xlabel("time [s]")
     ax2.set_ylabel("$S_t$ (log scale)")
     ax2.set_title("Panel 2 — real-time anomaly score (KL + innovation + residuals)")
-    ax2.legend(fontsize=8)
+    ax2.legend(fontsize=7, ncol=2)
 
     ax3 = fig.add_subplot(2, 2, 3)
     labels = [FaultMode(i).name for i in range(5)]
@@ -165,19 +186,35 @@ def main() -> None:
         mode="actor",
     )
 
-    nominal = record_episode(env, controller, mode=0, is_world_model=True)
-    # Calibrate the alarm threshold on the *measured* nominal surprise of this
-    # flight (skipping the first 20 samples, where the recurrent state is
-    # still warming up), exactly like the benchmark does.
-    nominal_surprise = torch.tensor(
-        nominal["surprise"][20:], dtype=torch.float32, device=device
-    )
+    # Calibrate the alarm threshold exactly like the benchmark does: on the
+    # nominal surprise of three *early* flights (the first 80 samples,
+    # skipping the first 20, where the recurrent state is still warming up).
+    # Using the whole flight instead would calibrate on the (much quieter)
+    # terminal phase and put the threshold below the score of the
+    # controller's own mode switches.
+    nominal = None
+    calibration = []
+    for _ in range(3):
+        flight = record_episode(env, controller, mode=0, is_world_model=True)
+        nominal = flight
+        calibration.append(
+            torch.tensor(flight["surprise"][20:80], dtype=torch.float32, device=device)
+        )
+    nominal_surprise = torch.cat([c for c in calibration if c.numel()])
     if nominal_surprise.numel() > 0:
         model.fdir.detector.calibrate(nominal_surprise)
     threshold = float(model.fdir.detector.threshold)
     fault = record_episode(env, controller, mode=args.mode, onset=args.onset, is_world_model=True, threshold=threshold)
     path = plot_fdir_telemetry(nominal, fault, args.output)
+    n_max = float(np.max(nominal["surprise"]))
+    f_alarm = int(np.sum(np.asarray(fault["alarm"])))
+    n_alarm = int(np.sum(np.asarray(nominal["alarm"])))
     print(f"wrote {path}")
+    print(
+        f"nominal: max S_t = {n_max:.3f} (threshold {threshold:.3f}), "
+        f"alarms raised: {n_alarm}"
+    )
+    print(f"fault: alarms raised: {f_alarm}")
 
 
 if __name__ == "__main__":

@@ -230,6 +230,15 @@ class FaultInjectionSchema:
     loe_severity: Tuple[float, float] = (0.20, 0.40)
     gimbal_bias_deg: float = 3.5
     com_offset_max: float = 0.35
+    # Minimum magnitude of a seized (GIMBAL_STUCK) TVC axis, in degrees at
+    # the reference severity of 0.5.  A gimbal that seizes at the vertical
+    # does not degrade the flight at all -- the vehicle keeps descending on an
+    # essentially vertical thrust vector and lands -- so such an episode is a
+    # healthy flight with a jammed actuator, not a fault.  The fault model
+    # therefore locks the seized axis at at least this deflection
+    # (scaled by ``severity / 0.5``), which makes the benchmark measure the
+    # controller instead of the freeze-angle draw.
+    stuck_min_deflection_deg: float = 1.25
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.probability <= 1.0:

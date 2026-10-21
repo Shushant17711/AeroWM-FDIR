@@ -43,7 +43,7 @@ PID LOE:          {'success': 2,  'crash': 14, 'timeout': 0, 'rate': 0.125}
 
 ```bash
 PYTHONPATH=. .venv/bin/python scripts/measure_sps.py
-# -> full env throughput: 262,046 SPS at B=1024   (262-277k across runs)
+# -> full env throughput: 267,915 SPS at B=1024   (262-278k across runs)
 ```
 
 The RK4 integrator gates are asserted by `tests/test_rk4_integrator.py`
@@ -70,12 +70,16 @@ PYTHONPATH=. .venv/bin/python scripts/check_fdir.py --episodes 20
 
 ```
 mode            detected latency[steps]  latency[ms]  isolation
-LOE_THRUST        100.0%           0.95         19.0     100.0%
-GIMBAL_BIAS       100.0%           0.95         19.0     100.0%
-GIMBAL_STUCK      100.0%           0.75         15.0     100.0%
-COM_SHIFT         100.0%           0.90         18.0     100.0%
-mean: detection 100.0 %, latency 0.89 steps (17.8 ms), isolation 100.0%
+LOE_THRUST        100.0%           2.00         40.0      95.0%
+GIMBAL_BIAS       100.0%           2.00         40.0     100.0%
+GIMBAL_STUCK      100.0%           2.00         40.0      85.0%
+COM_SHIFT         100.0%           2.00         40.0     100.0%
+mean: detection 100.0 %, latency 2.00 steps (40.0 ms), isolation 95.0%
 ```
+
+The latency is measured on the controller's **alarm** (the debounced,
+physics-gated decision), not on a single sample above the threshold; that is
+why it is one step larger than the raw crossing.
 
 ## 5. Gate 4 — the full benchmark (the published artefact)
 
@@ -86,7 +90,7 @@ PYTHONPATH=. .venv/bin/python -m eval.benchmark_fdir \
 
 Protocol: 20 episodes per fault mode, 8 parallel environments, seed 0,
 onset 150, severity 0.35 for `LOE_THRUST` and 0.5 otherwise, `--fast-mppi`
-(CEM/MPPI with K = 64, H = 5, 2 iterations).  Wall clock ≈ 27 min on the
+(CEM/MPPI with K = 64, H = 5, 2 iterations).  Wall clock ≈ 33 min on the
 reference machine.
 
 The benchmark loads `runs/aerowm_fdir/checkpoint_final.pt` and

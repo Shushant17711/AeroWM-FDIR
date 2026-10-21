@@ -28,9 +28,13 @@ Two derived quantities are exported alongside the 9-D feature vector:
     the true bias in a single sample instead of the ~0.57x under-estimate a
     filtered ``delta_meas - delta_cmd`` gives while the servo is slewing.
 ``frozen``
-    a 2-step-confirmed frozen-servo indicator: a stuck axis does not move at
-    all (``|Δdelta| < 1e-5``) while the command asks it to (``|Δdelta_expected|
-    > 2e-5``); a merely biased axis still tracks, so it never triggers.
+    a frozen-servo indicator confirmed over ``FREEZE_CONFIRM_STEPS``
+    consecutive samples: a seized axis does not move *at all* (the plant
+    holds it, so the state -- and the observation -- is unchanged to the last
+    bit) while the command asks it to (``|Δdelta_expected| > 2e-5``).  A
+    merely biased axis keeps tracking the command and therefore never
+    qualifies; before this test was made standstill-based, biased axes were
+    mis-isolated as `GIMBAL_STUCK`.
 
 The alternating command dither applied by the fault-conditioned controller
 (``PIDGains.excitation_dither``) guarantees the command never coincides with a
@@ -57,6 +61,11 @@ RES_OMEGA = slice(3, 6)
 CMD_GIMBAL = slice(6, 8)
 CMD_THRUST = slice(8, 9)
 RESIDUAL_DIM = 9
+# The six channels that are exact *physics* residuals (actuator tracking,
+# propulsion tracking, rigid-body rate balance).  Only these are scored by
+# the anomaly score; the command-tracking channels below them measure the
+# actuator's tracking error, which is large during any fast transient.
+RESIDUAL_PHYSICS_DIM = 6
 
 # Fault-parameter head layout (physical units, zero when nominal).
 PARAM_GIMBAL_Y = 0
@@ -67,8 +76,21 @@ PARAM_COM_Z = 4
 PARAM_DIM = 5
 
 # Movement thresholds for the frozen-servo test [rad].
-FREEZE_MOVE_TOL = 1e-5
+# A seized axis is bit-stationary (the plant holds it), so the "does not
+# move" threshold sits far below the float32 resolution of the gimbal
+# channel (4e-9 rad at 0.03 rad).
+FREEZE_MOVE_TOL = 1e-12
+# The command must actually ask for a movement, otherwise a stationary axis
+# that is already where it should be is not a fault.
 FREEZE_EXCITE_TOL = 2e-5
+# Number of consecutive bit-stationary samples that confirm a seized axis.
+# A biased axis occasionally cancels the command ripple against its slow
+# trend for one or two samples (measured maximum over the 20-episode
+# benchmark sample: 2), while a seized axis never moves again (measured
+# maximum run: the remainder of the flight, > 400 samples).  Four
+# consecutive stationary samples therefore separate the two with a margin
+# of two samples on the false side and hundreds on the true side.
+FREEZE_CONFIRM_STEPS = 4
 
 
 def throttle_to_thrust_norm(u: torch.Tensor, cfg: RocketPhysicsConfig) -> torch.Tensor:
@@ -102,6 +124,7 @@ class ResidualOutput:
     frozen_instant: Optional[torch.Tensor] = None  # [B, 2] 1-step test
     com_estimate: Optional[torch.Tensor] = None  # [B, 2] CoM offset [m]
     thrust_gain: float = 0.0  # [-] 1 - exp(-dt/tau_engine), for deconvolution
+    offset_drift: Optional[torch.Tensor] = None  # [B, 2] cmd-to-meas drift [rad]
 
 
 class ResidualExtractor(nn.Module):
@@ -129,6 +152,7 @@ class ResidualExtractor(nn.Module):
         self.register_buffer("ema_state", torch.zeros(0), persistent=False)
         self.register_buffer("bias_ema", torch.zeros(0), persistent=False)
         self.register_buffer("freeze_count", torch.zeros(0), persistent=False)
+        self.register_buffer("freeze_offset_ref", torch.zeros(0), persistent=False)
         self.register_buffer("com_ema", torch.zeros(0), persistent=False)
 
     # ------------------------------------------------------------------ #
@@ -206,19 +230,6 @@ class ResidualExtractor(nn.Module):
         ).clamp(-50.0, 50.0)
 
         # ------------------------------------------------------------------ #
-        # Frozen-servo test with 2-step confirmation.
-        # ------------------------------------------------------------------ #
-        actual_move = (delta_meas - delta_prev).abs()
-        expected_move = (delta_expected - delta_prev).abs()
-        frozen_inst = (actual_move < FREEZE_MOVE_TOL) & (expected_move > FREEZE_EXCITE_TOL)
-        if self.freeze_count.shape != frozen_inst.shape:
-            self.freeze_count = torch.zeros_like(frozen_inst, dtype=torch.long)
-        self.freeze_count = torch.where(
-            frozen_inst, self.freeze_count + 1, torch.zeros_like(self.freeze_count)
-        )
-        frozen = (self.freeze_count >= 2).to(features.dtype)
-
-        # ------------------------------------------------------------------ #
         # Deconvolved bias: res_gimbal == b * alpha_e for any command path.
         # ------------------------------------------------------------------ #
         # ``res_gimbal`` is normalised by the gimbal limit; convert to radians.
@@ -227,6 +238,57 @@ class ResidualExtractor(nn.Module):
             self.bias_ema = bias_step.detach().clone()
         # 4-sample average: rejects sensor noise only, adds no lag.
         self.bias_ema = 0.75 * self.bias_ema + 0.25 * bias_step.detach()
+
+        # ------------------------------------------------------------------ #
+        # Frozen-servo test with 2-step confirmation.
+        # ------------------------------------------------------------------ #
+        actual_move = (delta_meas - delta_prev).abs()
+        expected_move = (delta_expected - delta_prev).abs()
+        # The command-to-measurement offset.  It is a constant for a biased
+        # axis and grows for a locked one; the drift of the offset (measured
+        # against the offset at the last sample in which the axis moved) is
+        # exported as a diagnostic.
+        offset = delta_cmd - delta_meas
+        if self.freeze_offset_ref.shape != offset.shape:
+            self.freeze_offset_ref = offset.detach().clone()
+        moved = actual_move > 0.0
+        self.freeze_offset_ref = torch.where(moved, offset, self.freeze_offset_ref)
+        offset_drift = (offset - self.freeze_offset_ref).abs()
+        # A seized axis is *bit-stationary*: the plant commands the axis to
+        # stay where it is (``delta_cmd = gimbal``), so the integrated state
+        # -- and therefore the observation -- is unchanged to the last bit.
+        # The threshold is therefore far below the float32 resolution of the
+        # gimbal channel (4e-9 rad at 0.03 rad), which makes the test exact
+        # in practice.
+        #
+        # The threshold also has to separate the lock from a *bias*: a biased
+        # axis keeps tracking the command (it moves by 43.5 % of every
+        # command change), and its occasional near-zero steps are a
+        # cancellation of the command ripple and the slow trend, not a
+        # standstill -- the smallest such step measured over a 20-episode
+        # benchmark sample is 1.5e-6 rad, three orders of magnitude above
+        # this threshold.  Before this change the frozen test also fired on
+        # biased axes and mis-isolated GIMBAL_BIAS as GIMBAL_STUCK.
+        frozen_inst = (
+            (actual_move < FREEZE_MOVE_TOL)
+            & (expected_move > FREEZE_EXCITE_TOL)
+        )
+        # The *confirmation* counter only requires the axis to be
+        # bit-stationary.  It does not require the command to ask for a
+        # movement: a seized axis whose lock angle coincides with a
+        # saturated command (the controller is already commanding the gimbal
+        # stop) cannot be separated from a healthy axis at the stop by the
+        # command alone -- measured: 1 of 135 GIMBAL_STUCK episodes was
+        # mis-isolated that way.  A *biased* axis never stands still for
+        # four consecutive samples (measured maximum run: 2), so the
+        # confirmation still rejects it.
+        stationary = actual_move < FREEZE_MOVE_TOL
+        if self.freeze_count.shape != stationary.shape:
+            self.freeze_count = torch.zeros_like(stationary, dtype=torch.long)
+        self.freeze_count = torch.where(
+            stationary, self.freeze_count + 1, torch.zeros_like(self.freeze_count)
+        )
+        frozen = (self.freeze_count >= FREEZE_CONFIRM_STEPS).to(features.dtype)
 
         # ------------------------------------------------------------------ #
         # CoM estimate.  A CoM offset applies a *persistent* torque
@@ -254,6 +316,7 @@ class ResidualExtractor(nn.Module):
             frozen_instant=frozen_inst.to(features.dtype),
             com_estimate=self.com_ema,
             thrust_gain=float(thrust_gain),
+            offset_drift=offset_drift,
         )
 
     # ------------------------------------------------------------------ #
@@ -305,9 +368,17 @@ class ResidualExtractor(nn.Module):
         return (features - self.mean) / self.std.clamp_min(max(self.eps, 1e-3))
 
     def surprise(self, features: torch.Tensor) -> torch.Tensor:
-        """Chi-square style anomaly score (``~1`` in nominal flight)."""
+        """Chi-square style anomaly score (``~1`` in nominal flight).
+
+        Only the six *physics* channels are scored.  The three
+        command-tracking channels (``cmd_gimbal``, ``cmd_thrust``) measure how
+        far the actuator is from its command, which is large during any fast
+        transient -- the engine spooling down in the terminal phase reaches
+        6 sigma there -- and is not a fault signature.  They are still part of
+        the feature vector that the isolation head consumes.
+        """
         z = self.normalize(features)
-        return z.pow(2).mean(dim=-1)
+        return z[..., :RESIDUAL_PHYSICS_DIM].pow(2).mean(dim=-1)
 
     def smooth(self, features: torch.Tensor) -> torch.Tensor:
         """5-step EMA over the feature vector (state carried across calls)."""

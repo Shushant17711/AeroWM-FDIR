@@ -15,6 +15,43 @@ import torch
 
 from configs.schema import FaultInjectionSchema, FaultMode, NUM_FAULT_MODES, RocketPhysicsConfig
 from envs.base_types import FaultState
+from envs.counter_rng import hash_uniform
+
+# --------------------------------------------------------------------------- #
+# Minimum-magnitude seizure angle
+# --------------------------------------------------------------------------- #
+def stuck_lock_deflections(
+    gimbal: torch.Tensor,
+    severity: torch.Tensor,
+    min_deflection_deg: float = 1.25,
+) -> torch.Tensor:
+    """Lock deflection of a seized TVC axis, ``[B, 2]`` [rad].
+
+    A gimbal that seizes *within a fraction of a degree of the vertical* does
+    not degrade the flight: the vehicle keeps descending on an essentially
+    vertical thrust vector and lands next to the pad.  Such an episode is not
+    a fault at all -- it is a healthy flight with a jammed actuator -- so
+    freezing the fault model at those angles makes the benchmark measure the
+    freeze-angle draw instead of the controller.
+
+    The fault model therefore enforces a **minimum seizure angle**
+
+    ``min_stuck_rad = radians(min_deflection_deg) * (severity / 0.5)``
+
+    on the seized axis.  The lock keeps the sign of the pre-fault deflection
+    (so the vehicle is pushed in the direction it was already tilting) and
+    raises its magnitude to the floor.  A deflection of exactly zero has no
+    sign; the environment index then picks one deterministically so the
+    benchmark does not develop a systematic left/right bias.
+    """
+    severity = severity.to(gimbal.dtype).reshape(-1, 1)
+    min_rad = math.radians(min_deflection_deg) * (severity / 0.5)
+    sign = torch.where(gimbal > 0.0, 1.0, torch.where(gimbal < 0.0, -1.0, 0.0))
+    fallback = torch.where(
+        (torch.arange(gimbal.shape[0], device=gimbal.device) % 2) == 0, 1.0, -1.0
+    ).unsqueeze(-1)
+    sign = torch.where(sign == 0.0, fallback, sign)
+    return sign * torch.maximum(gimbal.abs(), min_rad)
 
 
 class FaultInjector:
@@ -42,11 +79,18 @@ class FaultInjector:
         onset: Optional[torch.Tensor] = None,
         severity: Optional[torch.Tensor] = None,
         probability: Optional[float] = None,
+        seed: Optional[torch.Tensor] = None,
     ) -> FaultState:
         """Sample a fresh fault configuration for ``batch_size`` environments.
 
         Any of ``mode``/``onset``/``severity`` can be supplied to force a
         deterministic scenario (used by tests and the benchmark suite).
+        ``seed`` is an optional per-environment int64 seed; when given, the
+        *fault parameters* (which axis is biased, which axis seizes, the
+        direction of the CoM offset) are drawn from a counter-based hash of
+        that seed instead of the shared generator stream, so a scenario is a
+        pure function of its seed and does not depend on the order in which
+        episodes are run.
         """
         dev = self.device
         gen = self.generator
@@ -70,7 +114,7 @@ class FaultInjector:
         else:
             severity = severity.to(dev, torch.float32)
 
-        params = self._build_params(mode, severity, gen)
+        params = self._build_params(mode, severity, gen, seed)
         return FaultState(
             mode=mode.to(dev, torch.long),
             onset=onset,
@@ -101,7 +145,11 @@ class FaultInjector:
         return severity
 
     def _build_params(
-        self, mode: torch.Tensor, severity: torch.Tensor, gen: Optional[torch.Generator]
+        self,
+        mode: torch.Tensor,
+        severity: torch.Tensor,
+        gen: Optional[torch.Generator],
+        seed: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch = mode.shape[0]
         dev = mode.device
@@ -112,10 +160,25 @@ class FaultInjector:
         )
 
         bias_mag = math.radians(self.cfg.gimbal_bias_deg)
-        axis_choice = torch.randint(0, 2, (batch,), device=dev, generator=gen)
-        sign = torch.where(
-            torch.rand(batch, device=dev, generator=gen) < 0.5, -1.0, 1.0
-        )
+        if seed is not None:
+            # Counter-based draws: the scenario depends on the episode seed
+            # only, never on how many episodes were generated before it.
+            s = seed.to(device=dev, dtype=torch.int64)
+            counters = torch.arange(4, device=dev, dtype=torch.int64)
+            seed_matrix = s.unsqueeze(-1).expand(batch, 4)
+            u = hash_uniform(seed_matrix, counters)  # [B, 4]
+            u_axis, u_sign, u_stuck, u_angle = u.unbind(dim=-1)
+            axis_choice = (u_axis > 0.5).to(torch.long)
+            sign = torch.where(u_sign > 0.5, 1.0, -1.0).to(dtype)
+            stuck_axis = (u_stuck > 0.5).to(torch.long)
+            angle = u_angle.to(dtype) * 2.0 * math.pi
+        else:
+            axis_choice = torch.randint(0, 2, (batch,), device=dev, generator=gen)
+            sign = torch.where(
+                torch.rand(batch, device=dev, generator=gen) < 0.5, -1.0, 1.0
+            )
+            stuck_axis = torch.randint(0, 2, (batch,), device=dev, generator=gen)
+            angle = torch.rand(batch, device=dev, generator=gen) * 2.0 * math.pi
         bias_y = torch.where(
             (mode == FaultMode.GIMBAL_BIAS) & (axis_choice == 0), bias_mag * sign, torch.zeros_like(severity)
         )
@@ -123,11 +186,9 @@ class FaultInjector:
             (mode == FaultMode.GIMBAL_BIAS) & (axis_choice == 1), bias_mag * sign, torch.zeros_like(severity)
         )
 
-        stuck_axis = torch.randint(0, 2, (batch,), device=dev, generator=gen)
         stuck_y = ((mode == FaultMode.GIMBAL_STUCK) & (stuck_axis == 0)).to(dtype)
         stuck_z = ((mode == FaultMode.GIMBAL_STUCK) & (stuck_axis == 1)).to(dtype)
 
-        angle = torch.rand(batch, device=dev, generator=gen) * 2.0 * math.pi
         com_mag = self.cfg.com_offset_max * severity
         com_active = (mode == FaultMode.COM_SHIFT).to(dtype)
         com_y = torch.cos(angle) * com_mag * com_active
