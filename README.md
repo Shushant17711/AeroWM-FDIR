@@ -63,8 +63,8 @@ fault mode, 8 parallel environments, seed 0, onset 150, severity 0.35 (LOE) /
 ¹ Eight of the twenty freezes are *benign* (the nozzle seizes within 1° of
 the vertical, so the flight is essentially healthy).  The classical law lands
 **0/16** of the severe freezes and **0 %** on the 48-episode unit-test
-protocol — see [§6](#6-what-the-baseline-cannot-do) and
-[`LIMITATIONS.md`](LIMITATIONS.md).
+protocol — see [§6](#6-what-the-baseline-cannot-do)
+and [`LIMITATIONS.md`](LIMITATIONS.md).
 
 **Detection and isolation** (same run; `scripts/check_fdir.py` reproduces it
 standalone):
@@ -267,9 +267,9 @@ implement.
 
 ---
 
-## 6. What the baseline cannot do — and where the numbers come from
+## 6. What the baseline cannot do
 
-The classical reference is deliberately **non-adaptive**: it never inspects
+*And where the numbers come from.*  The classical reference is deliberately **non-adaptive**: it never inspects
 the actuator state and it is not told the fault.  It lands 95 % of the
 nominal flights and 0-40 % of the faulted ones, and the variation between
 protocols is explained, not hidden:
