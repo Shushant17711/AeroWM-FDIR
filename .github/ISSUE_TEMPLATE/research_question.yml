@@ -1,0 +1,32 @@
+name: Research question or feature
+description: Propose an experiment, an additional fault mode, or a control/estimator change.
+labels: [research]
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Research question
+      description: What do you want to learn or change?  Phrase it as a question with a measurable answer.
+    validations:
+      required: true
+  - type: textarea
+    id: method
+    attributes:
+      label: Proposed method
+      description: The change, in enough detail that it can be implemented and measured.
+    validations:
+      required: true
+  - type: textarea
+    id: measurement
+    attributes:
+      label: How would you measure it?
+      description: Which gate or benchmark number would move, and by how much?
+    validations:
+      required: true
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: This keeps the frozen contracts (18-D observation, 3-D action, 5 fault modes) unchanged.
+        - label: This changes a frozen contract and needs a new release.

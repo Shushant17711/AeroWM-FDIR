@@ -1,0 +1,43 @@
+name: Bug report
+description: Something in the simulation, the controller, the detector or the tooling behaves differently from the report.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report.  This project is research software for a
+        simulated vehicle, so the most useful bug reports are ones that show
+        a *measured* difference from `results/TRAINING_REPORT.md`.
+
+        Please include the command you ran, the seed, the GPU, and the output
+        of `python scripts/gate_report.py results/eval_results.json`.
+  - type: input
+    id: command
+    attributes:
+      label: Command
+      description: The exact command that reproduces the problem
+      placeholder: PYTHONPATH=. python -m eval.benchmark_fdir --episodes 20 --fast-mppi
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What the report or the code says should happen
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behaviour
+      description: What actually happened, with the numbers
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: GPU, CUDA, PyTorch, Python
+      placeholder: RTX 4060 Laptop 8 GB, CUDA 12.8, torch 2.11.0+cu128, Python 3.12
+    validations:
+      required: true

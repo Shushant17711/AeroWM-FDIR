@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+title: "AeroWM-FDIR: latent world-model control with real-time fault detection, isolation and recovery for 6-DOF powered descent"
+message: "If you use this software, please cite it as below. The artefacts (benchmark results, telemetry figure and trained checkpoints) are released with the repository; see LIMITATIONS.md for the scope of the claims."
+type: software
+authors:
+  - family-names: "Shushant"
+    given-names: "Shushant"
+repository-code: "https://github.com/Shushant17711/AeroWM-FDIR"
+url: "https://github.com/Shushant17711/AeroWM-FDIR"
+abstract: >-
+  AeroWM-FDIR is a research stack for powered descent of a 6-DOF vehicle in
+  simulation. It combines a recurrent state-space latent world model
+  (RSSM, TD-MPC2 heads), an exact one-step physics-residual fault detector
+  with a 5-way isolator and latched class decision, a fault-conditioned
+  classical control law with a bounded learned residual, and a latent MPPI
+  planner. On the published 20-episode-per-mode benchmark the fault detector
+  alarms 0.9 steps (18 ms) after onset with 100 % detection and 99-100 %
+  isolation accuracy, and the FDIR stack lands 90-100 % of the faulted
+  flights while a non-adaptive cascaded-PID reference lands 0-40 %.
+keywords:
+  - fault detection and isolation
+  - world models
+  - model predictive control
+  - powered descent
+  - 6-DOF rigid-body dynamics
+  - reinforcement learning
+license: MIT
+version: 1.0.0
+date-released: "2026-10-21"
