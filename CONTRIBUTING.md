@@ -64,5 +64,5 @@ PYTHONPATH=. .venv/bin/python -m scripts.gate_report.py results/eval_results.jso
 ## Reporting bugs
 
 Open an issue with the command you ran, the seed, the GPU, and the output of
-`python -m scripts.gate_report.py results/eval_results.json`.  A minimal
+`python scripts/gate_report.py results/eval_results.json`.  A minimal
 reproduction is worth more than a description.
