@@ -127,3 +127,9 @@ result should note that this is not what the code does.
 
 MIT (see `LICENSE`).  Research use; no warranty; do not use it to command a
 real vehicle.
+
+> **Research software notice.**  This project is research software for a
+> simulated 6-DOF powered-descent vehicle.  It is released for reproducibility
+> and for teaching/portfolio use.  It is NOT flight software, it has not been
+> validated against hardware, and it carries no warranty of fitness for any
+> purpose.  See the sections above for the full statement of scope.

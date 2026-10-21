@@ -19,13 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-RESEARCH SOFTWARE NOTICE
-
-This project is research software for a simulated 6-DOF powered-descent
-vehicle.  It is released for reproducibility and for teaching/portfolio use.
-It is NOT flight software, it has not been validated against hardware, and it
-carries no warranty of fitness for any purpose.  See LIMITATIONS.md for the
-full statement of scope, and do not use it to command a real vehicle.
